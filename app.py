@@ -2,6 +2,8 @@
 import io
 import re
 import time
+import base64
+import xml.etree.ElementTree as ET
 import requests
 import pandas as pd
 import streamlit as st
@@ -297,27 +299,17 @@ def _norm_receitaws(data: dict) -> dict:
 
 # ==============================
 # MONTAGEM DO REGISTRO FINAL
-# Regras exatas conforme especificação:
-#   Col A → tipo       (planilha)
-#   Col B → cnpj       (planilha)
-#   Col C → IGNORADO
-#   Col D → conta_patrimonial (planilha)
-#   Demais campos → Receita Federal (API)
-#   Insc. Estadual / Municipal / Conta Débito → em branco
 # ==============================
 def montar_registro(entrada: dict, api: dict) -> dict:
     tem_erro = "erro" in api
     return {
-        # ── planilha do cliente ────────────────────────────────
         "cnpj"             : so_numeros(entrada["cnpj_raw"]),
         "_cnpj_fmt"        : formatar_cnpj(entrada["cnpj_raw"]),
         "tipo"             : entrada["tipo"],
         "conta_patrimonial": entrada.get("conta_patrimonial", ""),
-        # ── em branco (não existem no modelo de entrada nem na API pública)
         "conta_debito"        : "",
         "inscricao_estadual"  : "",
         "inscricao_municipal" : "",
-        # ── Receita Federal ────────────────────────────────────
         "razao_social" : api.get("razao_social", "") if not tem_erro else "",
         "nome_fantasia": api.get("nome_fantasia", "") if not tem_erro else "",
         "situacao"     : api.get("situacao", "")     if not tem_erro else "",
@@ -329,7 +321,6 @@ def montar_registro(entrada: dict, api: dict) -> dict:
         "complemento"  : api.get("complemento", "")  if not tem_erro else "",
         "cep"          : api.get("cep", "")          if not tem_erro else "",
         "telefone"     : api.get("telefone", "")     if not tem_erro else "",
-        # ── metadados internos ─────────────────────────────────
         "fonte"     : api.get("fonte", "—"),
         "_erro"     : tem_erro,
         "_msg_erro" : api.get("erro", ""),
@@ -338,8 +329,6 @@ def montar_registro(entrada: dict, api: dict) -> dict:
 
 # ==============================
 # GERAÇÃO DO EXCEL DE SAÍDA
-# Espelho exato de planilhamodelodominio.xls
-# 15 colunas + coluna "GERAR O ARQUIVO TXT" (em branco)
 # ==============================
 COLUNAS_SAIDA = [
     "C: cliente / F: Fornecedor",
@@ -366,7 +355,6 @@ def gerar_excel_saida(registros: list) -> bytes:
         cnpj_num = so_numeros(r.get("cnpj", ""))
         cep_num  = so_numeros(r.get("cep", ""))
 
-        # CNPJ e CEP como número inteiro (igual ao modelo original: 99999999000191.0)
         cnpj_val = float(cnpj_num) if cnpj_num else ""
         cep_val  = float(cep_num)  if cep_num  else ""
 
@@ -395,7 +383,6 @@ def gerar_excel_saida(registros: list) -> bytes:
         df.to_excel(writer, index=False, sheet_name="Plan1")
         ws = writer.sheets["Plan1"]
 
-        # larguras idênticas ao modelo original
         for col_letter, width in zip(
             list("ABCDEFGHIJKLMNO"),
             [28, 42, 20, 18, 18, 6, 26, 26, 36, 14, 22, 12, 20, 14, 16],
@@ -438,35 +425,29 @@ def gerar_excel_saida(registros: list) -> bytes:
 
 # ==============================
 # GERAÇÃO DO TXT (cli_for.txt)
-# Formato espelho de planilhamodelodominio.xls:
-# campo1;campo2;...;campo15
 # ==============================
 def gerar_txt_saida(registros: list) -> bytes:
-    """
-    Gera o cli_for.txt com os 15 campos separados por ponto-e-vírgula,
-    exatamente na mesma ordem das colunas do planilhamodelodominio.xls.
-    """
     linhas = []
     for r in registros:
         cnpj_num = so_numeros(r.get("cnpj", ""))
         cep_num  = so_numeros(r.get("cep", ""))
 
         campos = [
-            r.get("tipo", "C"),                               # C/F
-            r.get("razao_social", ""),                        # Razão Social
-            cnpj_num,                                         # CPF/CNPJ (só números)
-            inteiro_seguro(r.get("inscricao_estadual", "")),  # Insc. Estadual
-            inteiro_seguro(r.get("inscricao_municipal", "")), # Insc. Municipal
-            r.get("uf", ""),                                  # UF
-            r.get("municipio", ""),                           # Município
-            r.get("bairro", ""),                              # Bairro
-            r.get("logradouro", ""),                          # Endereço
-            r.get("numero", ""),                              # Número
-            r.get("complemento", ""),                         # Complemento
-            cep_num,                                          # CEP (só números)
-            r.get("telefone", ""),                            # Telefone
-            inteiro_seguro(r.get("conta_debito", "")),        # Conta débito
-            inteiro_seguro(r.get("conta_patrimonial", "")),   # Conta Patrimonial
+            r.get("tipo", "C"),
+            r.get("razao_social", ""),
+            cnpj_num,
+            inteiro_seguro(r.get("inscricao_estadual", "")),
+            inteiro_seguro(r.get("inscricao_municipal", "")),
+            r.get("uf", ""),
+            r.get("municipio", ""),
+            r.get("bairro", ""),
+            r.get("logradouro", ""),
+            r.get("numero", ""),
+            r.get("complemento", ""),
+            cep_num,
+            r.get("telefone", ""),
+            inteiro_seguro(r.get("conta_debito", "")),
+            inteiro_seguro(r.get("conta_patrimonial", "")),
         ]
         linhas.append(";".join(str(c) for c in campos))
 
@@ -474,8 +455,76 @@ def gerar_txt_saida(registros: list) -> bytes:
 
 
 # ==============================
+# GERAÇÃO DO XML (cli_for.xml)
+# ==============================
+def _indent_xml(elem, level=0):
+    """Indentação compatível com Python 3.8 e superior."""
+    pad = "\n" + "  " * level
+    if len(elem):
+        if not elem.text or not elem.text.strip():
+            elem.text = pad + "  "
+        if not elem.tail or not elem.tail.strip():
+            elem.tail = pad
+        for child in elem:
+            _indent_xml(child, level + 1)
+        if not child.tail or not child.tail.strip():
+            child.tail = pad
+    else:
+        if level and (not elem.tail or not elem.tail.strip()):
+            elem.tail = pad
+
+
+def gerar_xml_saida(registros: list) -> bytes:
+    """Gera o cli_for.xml estruturado com 17 campos por registro."""
+    root = ET.Element("ClientesFornecedores")
+    root.set("versao", "1.0")
+    root.set("geradoPor", "Cadastro CF - Thomson Reuters")
+
+    for r in registros:
+        cf = ET.SubElement(root, "ClienteFornecedor")
+
+        def add(tag: str, value: str):
+            el = ET.SubElement(cf, tag)
+            el.text = str(value) if value else ""
+
+        cnpj_num = so_numeros(r.get("cnpj", ""))
+        cep_num  = so_numeros(r.get("cep", ""))
+
+        add("Tipo",                r.get("tipo", "C"))
+        add("RazaoSocial",         r.get("razao_social", ""))
+        add("NomeFantasia",        r.get("nome_fantasia", ""))
+        add("CPFCNPJ",             cnpj_num)
+        add("InscricaoEstadual",   inteiro_seguro(r.get("inscricao_estadual", "")))
+        add("InscricaoMunicipal",  inteiro_seguro(r.get("inscricao_municipal", "")))
+        add("SituacaoReceita",     r.get("situacao", ""))
+        add("UF",                  r.get("uf", ""))
+        add("Municipio",           r.get("municipio", ""))
+        add("Bairro",              r.get("bairro", ""))
+        add("Endereco",            r.get("logradouro", ""))
+        add("NumeroEndereco",      r.get("numero", ""))
+        add("ComplementoEndereco", r.get("complemento", ""))
+        add("CEP",                 cep_num)
+        add("Telefone",            r.get("telefone", ""))
+        add("ContaDebito",         inteiro_seguro(r.get("conta_debito", "")))
+        add("ContaPatrimonial",    inteiro_seguro(r.get("conta_patrimonial", "")))
+
+    _indent_xml(root)
+
+    buf = io.BytesIO()
+    tree = ET.ElementTree(root)
+    tree.write(buf, encoding="utf-8", xml_declaration=True)
+    buf.seek(0)
+    return buf.read()
+
+
+def gerar_xml_base64(registros: list) -> str:
+    """Retorna o cli_for.xml codificado em Base64 (string UTF-8)."""
+    xml_bytes = gerar_xml_saida(registros)
+    return base64.b64encode(xml_bytes).decode("utf-8")
+
+
+# ==============================
 # MODELO DE ENTRADA PARA DOWNLOAD
-# 4 colunas que o cliente preenche
 # ==============================
 def gerar_modelo_entrada() -> bytes:
     colunas = [
@@ -511,17 +560,14 @@ def gerar_modelo_entrada() -> bytes:
         ex_fill      = PatternFill("solid", fgColor="FFF3E0")
         ex_font      = Font(name="Segoe UI", size=10, italic=True, color="888888")
 
-        # cabeçalho
         for cell in ws[1]:
             cell.fill      = header_fill
             cell.font      = header_font
             cell.alignment = center_align
             cell.border    = thin_border
 
-        # col C com fundo diferente (informativo)
         ws["C1"].fill = PatternFill("solid", fgColor="777777")
 
-        # linhas de exemplo
         for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
             for cell in row:
                 cell.fill      = ex_fill
@@ -698,6 +744,9 @@ def main():
                 <li><b>cli_for.txt</b> →
                     campos separados por <code>;</code>,
                     pronto para importação.</li>
+                <li><b>cli_for.xml</b> →
+                    XML estruturado com 17 campos,
+                    codificado em <code>Base64</code>.</li>
             </ul>
 
             <h4>🔹 Passo 5 — Importar no Domínio</h4>
@@ -727,6 +776,7 @@ def main():
         ("log",         [f"Aplicação pronta. Versão: {VERSAO}"]),
         ("xlsx_bytes",  None),
         ("txt_bytes",   None),
+        ("xml_b64",     None),   # ← NOVO
     ]:
         if key not in st.session_state:
             st.session_state[key] = default
@@ -755,6 +805,7 @@ def main():
         st.session_state.log        = ["Campos limpos."]
         st.session_state.xlsx_bytes = None
         st.session_state.txt_bytes  = None
+        st.session_state.xml_b64    = None   # ← NOVO
         st.rerun()
 
     # ── processamento ──────────────────────────────────────────
@@ -763,6 +814,7 @@ def main():
         st.session_state.log        = ["Iniciando processamento..."]
         st.session_state.xlsx_bytes = None
         st.session_state.txt_bytes  = None
+        st.session_state.xml_b64    = None   # ← NOVO
 
         registros = processar(arquivo.read(), st.session_state.log)
         st.session_state.registros = registros
@@ -770,6 +822,7 @@ def main():
         if registros:
             st.session_state.xlsx_bytes = gerar_excel_saida(registros)
             st.session_state.txt_bytes  = gerar_txt_saida(registros)
+            st.session_state.xml_b64    = gerar_xml_base64(registros)   # ← NOVO
             st.session_state.log.append("📁 Arquivos prontos para download.")
 
         st.rerun()
@@ -834,7 +887,7 @@ def main():
         st.markdown("---")
         st.markdown("#### ⬇ Exportar arquivos")
 
-        col_a, col_b = st.columns(2)
+        col_a, col_b, col_c = st.columns(3)   # ← era st.columns(2)
 
         with col_a:
             st.markdown(
@@ -898,6 +951,54 @@ def main():
             else:
                 st.button(
                     "⬇ Baixar cli_for.txt",
+                    disabled=True,
+                    use_container_width=True,
+                )
+
+        with col_c:   # ← NOVO bloco inteiro
+            st.markdown(
+                """
+                <div style="background:#F5F5F5; border:1px solid #E0E0E0;
+                            border-left:4px solid #FF8000; border-radius:6px;
+                            padding:14px 16px; margin-bottom:8px;">
+                    <div style="font-weight:bold; color:#444; margin-bottom:4px;">
+                        🗂 cli_for.xml
+                    </div>
+                    <div style="font-size:12px; color:#777;">
+                        XML estruturado · 17 campos por registro.<br>
+                        Arquivo codificado em <code>Base64</code> UTF-8.
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            if st.session_state.xml_b64:
+                xml_bytes_dl = base64.b64decode(
+                    st.session_state.xml_b64.encode("utf-8")
+                )
+                st.download_button(
+                    label="⬇ Baixar cli_for.xml",
+                    data=xml_bytes_dl,
+                    file_name="cli_for.xml",
+                    mime="application/xml",
+                    use_container_width=True,
+                    type="primary",
+                )
+                st.markdown(
+                    "<div style='font-size:11px; color:#888; margin-top:6px;'>"
+                    "🔐 Conteúdo Base64 (copiável):</div>",
+                    unsafe_allow_html=True,
+                )
+                st.text_area(
+                    label="",
+                    value=st.session_state.xml_b64,
+                    height=100,
+                    label_visibility="collapsed",
+                    key="xml_b64_display",
+                )
+            else:
+                st.button(
+                    "⬇ Baixar cli_for.xml",
                     disabled=True,
                     use_container_width=True,
                 )
