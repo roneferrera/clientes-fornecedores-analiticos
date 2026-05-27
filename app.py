@@ -139,71 +139,62 @@ def extrair_telefone(raw: str) -> str:
     return raw.strip()
 
 
+def inteiro_seguro(v) -> str:
+    """Converte float como 9999.0 → '9999', string '9999' → '9999'."""
+    t = texto(v)
+    if not t:
+        return ""
+    try:
+        return str(int(float(t)))
+    except Exception:
+        return t
+
+
 # ==============================
 # LEITURA DA PLANILHA DO CLIENTE
-# Colunas fixas (por posição):
+# Colunas por POSIÇÃO:
 #   A (0) → C / F
 #   B (1) → CNPJ
-#   C (2) → Descrição Conta (informativo, ignorado)
+#   C (2) → Descrição Conta (informativo — IGNORADO)
 #   D (3) → Conta Patrimonial
 # ==============================
 def ler_planilha_cliente(arquivo_bytes: bytes) -> tuple:
-    """
-    Lê a planilha modelo preenchida pelo cliente.
-    Retorna (lista_de_dicts, lista_de_erros).
-
-    Leitura por POSIÇÃO de coluna (A=0, B=1, C=2, D=3),
-    tolerando qualquer nome de cabeçalho.
-    """
-    erros    = []
+    erros     = []
     registros = []
 
     try:
-        # tenta xlsx, fallback para xls
         try:
             df = pd.read_excel(
                 io.BytesIO(arquivo_bytes),
-                sheet_name=0,
-                header=None,
-                dtype=object,
+                sheet_name=0, header=None, dtype=object,
             )
         except Exception:
             df = pd.read_excel(
                 io.BytesIO(arquivo_bytes),
-                sheet_name=0,
-                header=None,
-                dtype=object,
-                engine="xlrd",
+                sheet_name=0, header=None, dtype=object, engine="xlrd",
             )
 
         df = df.fillna("")
 
-        # ── detecta linha de cabeçalho ──────────────────────────
-        # procura a primeira linha que contenha "cnpj" ou "c/f" ou "tipo"
-        linha_cabecalho = None
+        # ── detecta linha de cabeçalho ──────────────────────
+        inicio_dados = 1
         for i in range(min(10, len(df))):
-            vals = [str(v).strip().lower() for v in df.iloc[i].tolist()]
+            vals   = [str(v).strip().lower() for v in df.iloc[i].tolist()]
             joined = " ".join(vals)
-            if any(k in joined for k in ["cnpj", "cpf", "c / f", "c/f", "tipo", "cliente"]):
-                linha_cabecalho = i
+            if any(k in joined for k in ["cnpj", "cpf", "c / f", "c/f", "tipo", "cliente", "fornecedor"]):
+                inicio_dados = i + 1
                 break
-
-        # pula cabeçalho; se não encontrado, assume linha 0 como cabeçalho
-        inicio_dados = (linha_cabecalho + 1) if linha_cabecalho is not None else 1
 
         for i in range(inicio_dados, len(df)):
             row = df.iloc[i].tolist()
-
-            # garante ao menos 4 colunas
             while len(row) < 4:
                 row.append("")
 
             col_a = texto(row[0])   # C / F
             col_b = texto(row[1])   # CNPJ
-            col_c = texto(row[2])   # Descrição (ignorado)
+            # col_c = ignorado       # Descrição Conta (informativo)
             col_d = texto(row[3])   # Conta Patrimonial
 
-            # pula linha completamente vazia
             if not col_a and not col_b and not col_d:
                 continue
 
@@ -219,7 +210,6 @@ def ler_planilha_cliente(arquivo_bytes: bytes) -> tuple:
                 "tipo"            : tipo,
                 "cnpj_raw"        : cnpj_raw,
                 "conta_patrimonial": col_d,
-                # col_c é meramente informativo — não é usado
             })
 
     except Exception as e:
@@ -245,32 +235,18 @@ def consultar_cnpj_api(cnpj_raw: str) -> dict:
 
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 
-    # ── BrasilAPI ──────────────────────────────────────────────
     try:
-        resp = requests.get(
-            BRASILAPI_URL.format(cnpj=cnpj),
-            headers=headers,
-            timeout=15,
-        )
+        resp = requests.get(BRASILAPI_URL.format(cnpj=cnpj), headers=headers, timeout=15)
         if resp.status_code == 429:
             time.sleep(3)
-            resp = requests.get(
-                BRASILAPI_URL.format(cnpj=cnpj),
-                headers=headers,
-                timeout=15,
-            )
+            resp = requests.get(BRASILAPI_URL.format(cnpj=cnpj), headers=headers, timeout=15)
         if resp.status_code == 200:
             return _norm_brasilapi(resp.json())
     except Exception:
         pass
 
-    # ── ReceitaWS (fallback) ───────────────────────────────────
     try:
-        resp = requests.get(
-            RECEITAWS_URL.format(cnpj=cnpj),
-            headers=headers,
-            timeout=15,
-        )
+        resp = requests.get(RECEITAWS_URL.format(cnpj=cnpj), headers=headers, timeout=15)
         if resp.status_code == 200:
             return _norm_receitaws(resp.json())
     except Exception:
@@ -321,26 +297,27 @@ def _norm_receitaws(data: dict) -> dict:
 
 # ==============================
 # MONTAGEM DO REGISTRO FINAL
-# Regras:
-#   tipo             → planilha (col A)
-#   cnpj             → planilha (col B)  [col C ignorada]
-#   conta_patrimonial→ planilha (col D)
-#   tudo mais        → API Receita Federal
+# Regras exatas conforme especificação:
+#   Col A → tipo       (planilha)
+#   Col B → cnpj       (planilha)
+#   Col C → IGNORADO
+#   Col D → conta_patrimonial (planilha)
+#   Demais campos → Receita Federal (API)
+#   Insc. Estadual / Municipal / Conta Débito → em branco
 # ==============================
 def montar_registro(entrada: dict, api: dict) -> dict:
     tem_erro = "erro" in api
     return {
-        # ── da planilha do cliente ─────────────────────────────
+        # ── planilha do cliente ────────────────────────────────
         "cnpj"             : so_numeros(entrada["cnpj_raw"]),
         "_cnpj_fmt"        : formatar_cnpj(entrada["cnpj_raw"]),
         "tipo"             : entrada["tipo"],
         "conta_patrimonial": entrada.get("conta_patrimonial", ""),
-        # ── campos que NÃO existem na planilha de entrada
-        #    e NÃO vêm da API pública (ficam em branco)
+        # ── em branco (não existem no modelo de entrada nem na API pública)
         "conta_debito"        : "",
         "inscricao_estadual"  : "",
         "inscricao_municipal" : "",
-        # ── da Receita Federal ─────────────────────────────────
+        # ── Receita Federal ────────────────────────────────────
         "razao_social" : api.get("razao_social", "") if not tem_erro else "",
         "nome_fantasia": api.get("nome_fantasia", "") if not tem_erro else "",
         "situacao"     : api.get("situacao", "")     if not tem_erro else "",
@@ -352,16 +329,17 @@ def montar_registro(entrada: dict, api: dict) -> dict:
         "complemento"  : api.get("complemento", "")  if not tem_erro else "",
         "cep"          : api.get("cep", "")          if not tem_erro else "",
         "telefone"     : api.get("telefone", "")     if not tem_erro else "",
-        # ── metadados ──────────────────────────────────────────
-        "fonte"        : api.get("fonte", "—"),
-        "_erro"        : tem_erro,
-        "_msg_erro"    : api.get("erro", ""),
+        # ── metadados internos ─────────────────────────────────
+        "fonte"     : api.get("fonte", "—"),
+        "_erro"     : tem_erro,
+        "_msg_erro" : api.get("erro", ""),
     }
 
 
 # ==============================
 # GERAÇÃO DO EXCEL DE SAÍDA
-# Formato: planilhamodelodominio.xls
+# Espelho exato de planilhamodelodominio.xls
+# 15 colunas + coluna "GERAR O ARQUIVO TXT" (em branco)
 # ==============================
 COLUNAS_SAIDA = [
     "C: cliente / F: Fornecedor",
@@ -387,22 +365,27 @@ def gerar_excel_saida(registros: list) -> bytes:
     for r in registros:
         cnpj_num = so_numeros(r.get("cnpj", ""))
         cep_num  = so_numeros(r.get("cep", ""))
+
+        # CNPJ e CEP como número inteiro (igual ao modelo original: 99999999000191.0)
+        cnpj_val = float(cnpj_num) if cnpj_num else ""
+        cep_val  = float(cep_num)  if cep_num  else ""
+
         rows.append({
             "C: cliente / F: Fornecedor": r.get("tipo", "C"),
             "Razão Social"              : r.get("razao_social", ""),
-            "CPF/CNPJ"                  : float(cnpj_num) if cnpj_num else "",
-            "Inscrição Estadual"        : r.get("inscricao_estadual", ""),
-            "Inscrição Municipal"       : r.get("inscricao_municipal", ""),
+            "CPF/CNPJ"                  : cnpj_val,
+            "Inscrição Estadual"        : inteiro_seguro(r.get("inscricao_estadual", "")),
+            "Inscrição Municipal"       : inteiro_seguro(r.get("inscricao_municipal", "")),
             "UF"                        : r.get("uf", ""),
             "Município"                 : r.get("municipio", ""),
             "Bairro"                    : r.get("bairro", ""),
             "Endereço"                  : r.get("logradouro", ""),
             "Número Endereço"           : r.get("numero", ""),
             "Complemento Endereço"      : r.get("complemento", ""),
-            "CEP"                       : float(cep_num) if cep_num else "",
+            "CEP"                       : cep_val,
             "Telefone"                  : r.get("telefone", ""),
-            "Conta débito"              : r.get("conta_debito", ""),
-            "Conta Patrimonial"         : r.get("conta_patrimonial", ""),
+            "Conta débito"              : inteiro_seguro(r.get("conta_debito", "")),
+            "Conta Patrimonial"         : inteiro_seguro(r.get("conta_patrimonial", "")),
         })
 
     df = pd.DataFrame(rows, columns=COLUNAS_SAIDA)
@@ -412,14 +395,13 @@ def gerar_excel_saida(registros: list) -> bytes:
         df.to_excel(writer, index=False, sheet_name="Plan1")
         ws = writer.sheets["Plan1"]
 
-        # larguras das colunas A–O
+        # larguras idênticas ao modelo original
         for col_letter, width in zip(
             list("ABCDEFGHIJKLMNO"),
             [28, 42, 20, 18, 18, 6, 26, 26, 36, 14, 22, 12, 20, 14, 16],
         ):
             ws.column_dimensions[col_letter].width = width
 
-        # estilos
         header_fill  = PatternFill("solid", fgColor="FF8000")
         header_font  = Font(bold=True, color="FFFFFF", name="Segoe UI", size=10)
         thin_side    = Side(style="thin", color="CCCCCC")
@@ -456,40 +438,46 @@ def gerar_excel_saida(registros: list) -> bytes:
 
 # ==============================
 # GERAÇÃO DO TXT (cli_for.txt)
+# Formato espelho de planilhamodelodominio.xls:
+# campo1;campo2;...;campo15
 # ==============================
 def gerar_txt_saida(registros: list) -> bytes:
+    """
+    Gera o cli_for.txt com os 15 campos separados por ponto-e-vírgula,
+    exatamente na mesma ordem das colunas do planilhamodelodominio.xls.
+    """
     linhas = []
     for r in registros:
+        cnpj_num = so_numeros(r.get("cnpj", ""))
+        cep_num  = so_numeros(r.get("cep", ""))
+
         campos = [
-            r.get("tipo", "C"),
-            r.get("razao_social", ""),
-            formatar_cnpj(r.get("cnpj", "")),
-            r.get("inscricao_estadual", ""),
-            r.get("inscricao_municipal", ""),
-            r.get("uf", ""),
-            r.get("municipio", ""),
-            r.get("bairro", ""),
-            r.get("logradouro", ""),
-            r.get("numero", ""),
-            r.get("complemento", ""),
-            formatar_cep(r.get("cep", "")),
-            r.get("telefone", ""),
-            r.get("conta_debito", ""),
-            r.get("conta_patrimonial", ""),
+            r.get("tipo", "C"),                               # C/F
+            r.get("razao_social", ""),                        # Razão Social
+            cnpj_num,                                         # CPF/CNPJ (só números)
+            inteiro_seguro(r.get("inscricao_estadual", "")),  # Insc. Estadual
+            inteiro_seguro(r.get("inscricao_municipal", "")), # Insc. Municipal
+            r.get("uf", ""),                                  # UF
+            r.get("municipio", ""),                           # Município
+            r.get("bairro", ""),                              # Bairro
+            r.get("logradouro", ""),                          # Endereço
+            r.get("numero", ""),                              # Número
+            r.get("complemento", ""),                         # Complemento
+            cep_num,                                          # CEP (só números)
+            r.get("telefone", ""),                            # Telefone
+            inteiro_seguro(r.get("conta_debito", "")),        # Conta débito
+            inteiro_seguro(r.get("conta_patrimonial", "")),   # Conta Patrimonial
         ]
         linhas.append(";".join(str(c) for c in campos))
+
     return ("\n".join(linhas) + "\n").encode("utf-8", errors="replace")
 
 
 # ==============================
 # MODELO DE ENTRADA PARA DOWNLOAD
-# (planilha que o cliente preenche)
+# 4 colunas que o cliente preenche
 # ==============================
 def gerar_modelo_entrada() -> bytes:
-    """
-    Gera o modelo.xlsx com as 4 colunas que o cliente preenche:
-    A: C/F  |  B: CNPJ  |  C: Descrição Conta (informativo)  |  D: Conta Patrimonial
-    """
     colunas = [
         "C: cliente / F: Fornecedor",
         "CPF/CNPJ",
@@ -497,11 +485,11 @@ def gerar_modelo_entrada() -> bytes:
         "Conta Patrimonial",
     ]
     exemplos = [
-        ["C", "99.999.999/0001-91", "Clientes Nacionais",   "7777"],
-        ["F", "88.888.888/0001-81", "Fornecedores Gerais",  "6666"],
-        ["C", "11.222.333/0001-81", "Clientes Exportação",  "5555"],
+        ["C", "99.999.999/0001-91", "Clientes Nacionais",  "7777"],
+        ["F", "88.888.888/0001-81", "Fornecedores Gerais", "6666"],
+        ["C", "11.222.333/0001-81", "Clientes Exportação", "5555"],
     ]
-    df = pd.DataFrame(exemplos, columns=colunas)
+    df  = pd.DataFrame(exemplos, columns=colunas)
     buf = io.BytesIO()
 
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -523,21 +511,23 @@ def gerar_modelo_entrada() -> bytes:
         ex_fill      = PatternFill("solid", fgColor="FFF3E0")
         ex_font      = Font(name="Segoe UI", size=10, italic=True, color="888888")
 
+        # cabeçalho
         for cell in ws[1]:
             cell.fill      = header_fill
             cell.font      = header_font
             cell.alignment = center_align
             cell.border    = thin_border
 
+        # col C com fundo diferente (informativo)
+        ws["C1"].fill = PatternFill("solid", fgColor="777777")
+
+        # linhas de exemplo
         for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
             for cell in row:
                 cell.fill      = ex_fill
                 cell.font      = ex_font
                 cell.alignment = left_align
                 cell.border    = thin_border
-
-        # nota informativa na coluna C
-        ws["C1"].fill = PatternFill("solid", fgColor="888888")
 
         ws.freeze_panes = "A2"
 
@@ -549,11 +539,6 @@ def gerar_modelo_entrada() -> bytes:
 # PROCESSAMENTO CENTRAL
 # ==============================
 def processar(arquivo_bytes: bytes, log: list) -> list:
-    """
-    1. Lê planilha do cliente (A=tipo, B=CNPJ, C=ignorado, D=conta_patrimonial)
-    2. Consulta cada CNPJ na API da Receita Federal
-    3. Monta registros finais
-    """
     registros_entrada, erros = ler_planilha_cliente(arquivo_bytes)
 
     for e in erros:
@@ -583,9 +568,7 @@ def processar(arquivo_bytes: bytes, log: list) -> list:
         result.append(registro)
 
         if registro["_erro"]:
-            log.append(
-                f"✗ {cnpj_fmt} [{tipo_desc}] → {registro['_msg_erro']}"
-            )
+            log.append(f"✗ {cnpj_fmt} [{tipo_desc}] → {registro['_msg_erro']}")
         else:
             log.append(
                 f"✓ {cnpj_fmt} [{tipo_desc}] → "
@@ -628,10 +611,9 @@ def main():
             </h2>
             <p style="color:#DDDDDD; margin:6px 0 0 0;
                       font-family:'Segoe UI',Arial,sans-serif;">
-                Importe a planilha preenchida com
-                <strong>C/F</strong>, <strong>CNPJ</strong> e
-                <strong>Conta Patrimonial</strong>, consulte a
-                Receita Federal e exporte no formato
+                Importe a planilha com <strong>C/F</strong>,
+                <strong>CNPJ</strong> e <strong>Conta Patrimonial</strong>,
+                consulte a Receita Federal e exporte no formato
                 <strong>Domínio Sistemas</strong>.
             </p>
         </div>
@@ -650,22 +632,19 @@ def main():
             label="⬇ Baixar modelo de entrada (.xlsx)",
             data=modelo_bytes,
             file_name="modelo_clientes_fornecedores.xlsx",
-            mime=(
-                "application/vnd.openxmlformats-"
-                "officedocument.spreadsheetml.sheet"
-            ),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
         st.markdown("---")
         st.markdown("### 📋 Colunas do modelo")
         st.markdown(
             """
-            | Col | Campo | Uso |
-            |-----|-------|-----|
-            | **A** | C / F | Obrigatório |
-            | **B** | CNPJ | Obrigatório |
-            | **C** | Descrição Conta | Informativo |
-            | **D** | Conta Patrimonial | Obrigatório |
+| Col | Campo | Uso |
+|-----|-------|-----|
+| **A** | C / F | Obrigatório |
+| **B** | CNPJ | Obrigatório |
+| **C** | Descrição Conta | ℹ Informativo |
+| **D** | Conta Patrimonial | Obrigatório |
             """
         )
         st.markdown("---")
@@ -697,12 +676,12 @@ def main():
                 <li><b>Coluna B</b> — <code>CPF/CNPJ</code>:
                     informe o CNPJ (com ou sem formatação).</li>
                 <li><b>Coluna C</b> — <code>Descrição Conta Plano Cliente</code>:
-                    campo <b>informativo</b>, não é processado.</li>
+                    campo <b>informativo</b>, não é processado nem exportado.</li>
                 <li><b>Coluna D</b> — <code>Conta Patrimonial</code>:
                     informe o código da conta.</li>
             </ul>
-            <p>Razão Social, Endereço, UF, Município, CEP e demais dados
-            são preenchidos <b>automaticamente</b> pela Receita Federal.</p>
+            <p>Razão Social, Endereço, UF, Município, CEP, Telefone e demais
+            dados são preenchidos <b>automaticamente</b> pela Receita Federal.</p>
 
             <h4>🔹 Passo 3 — Upload e processamento</h4>
             <ol>
@@ -714,10 +693,11 @@ def main():
 
             <h4>🔹 Passo 4 — Exportar</h4>
             <ul>
-                <li><b>Excel (.xlsx)</b> →
-                    formato <code>planilhamodelodominio</code>.</li>
-                <li><b>TXT (cli_for.txt)</b> →
-                    pronto para importação no Domínio Sistemas.</li>
+                <li><b>planilhamodelodominio.xlsx</b> →
+                    15 colunas no formato exato do Domínio Sistemas.</li>
+                <li><b>cli_for.txt</b> →
+                    campos separados por <code>;</code>,
+                    pronto para importação.</li>
             </ul>
 
             <h4>🔹 Passo 5 — Importar no Domínio</h4>
@@ -728,10 +708,9 @@ def main():
             <h4>⚠ Observações</h4>
             <ul>
                 <li>Inscrição Estadual/Municipal e Conta Débito ficam
-                    <b>em branco</b> (não são retornados pela API pública
-                    e não constam no modelo de entrada).</li>
-                <li>CNPJs com erro de consulta são sinalizados no log
-                    e mantidos na exportação com os campos em branco.</li>
+                    <b>em branco</b> (não disponíveis via API pública).</li>
+                <li>CNPJs com erro de consulta são exportados com os
+                    campos da Receita Federal em branco.</li>
                 <li>Limite da API: ~5 req/min —
                     intervalo automático aplicado.</li>
             </ul>
@@ -757,10 +736,7 @@ def main():
     arquivo = st.file_uploader(
         "Selecione o arquivo (.xls / .xlsx)",
         type=["xls", "xlsx"],
-        help=(
-            "Planilha com 4 colunas: "
-            "C/F | CNPJ | Descrição Conta (ignorado) | Conta Patrimonial"
-        ),
+        help="Planilha com 4 colunas: C/F | CNPJ | Descrição (ignorado) | Conta Patrimonial",
     )
 
     col1, col2 = st.columns([1, 1])
@@ -815,10 +791,7 @@ def main():
                 "Telefone"         : r["telefone"],
                 "Conta Patrimonial": r["conta_patrimonial"],
                 "Fonte"            : r["fonte"],
-                "Status"           : (
-                    "✅ OK" if not r["_erro"]
-                    else f"⚠ {r['_msg_erro']}"
-                ),
+                "Status"           : "✅ OK" if not r["_erro"] else f"⚠ {r['_msg_erro']}",
             }
             for r in st.session_state.registros
         ])
@@ -857,33 +830,76 @@ def main():
                 "exportados com os campos da Receita Federal em branco."
             )
 
-        # ── downloads ─────────────────────────────────────────
+        # ── seção de downloads ────────────────────────────────
         st.markdown("---")
-        st.markdown("#### ⬇ Exportar")
+        st.markdown("#### ⬇ Exportar arquivos")
 
         col_a, col_b = st.columns(2)
+
         with col_a:
+            st.markdown(
+                """
+                <div style="background:#F5F5F5; border:1px solid #E0E0E0;
+                            border-left:4px solid #FF8000; border-radius:6px;
+                            padding:14px 16px; margin-bottom:8px;">
+                    <div style="font-weight:bold; color:#444; margin-bottom:4px;">
+                        📊 planilhamodelodominio.xlsx
+                    </div>
+                    <div style="font-size:12px; color:#777;">
+                        15 colunas no formato exato do Domínio Sistemas.<br>
+                        Cabeçalho laranja · Zebrado · Linha congelada.
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
             if st.session_state.xlsx_bytes:
                 st.download_button(
-                    label="⬇ Baixar Excel — planilhamodelodominio.xlsx",
+                    label="⬇ Baixar planilhamodelodominio.xlsx",
                     data=st.session_state.xlsx_bytes,
                     file_name="planilhamodelodominio.xlsx",
-                    mime=(
-                        "application/vnd.openxmlformats-"
-                        "officedocument.spreadsheetml.sheet"
-                    ),
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
                     type="primary",
                 )
+            else:
+                st.button(
+                    "⬇ Baixar planilhamodelodominio.xlsx",
+                    disabled=True,
+                    use_container_width=True,
+                )
+
         with col_b:
+            st.markdown(
+                """
+                <div style="background:#F5F5F5; border:1px solid #E0E0E0;
+                            border-left:4px solid #FF8000; border-radius:6px;
+                            padding:14px 16px; margin-bottom:8px;">
+                    <div style="font-weight:bold; color:#444; margin-bottom:4px;">
+                        📄 cli_for.txt
+                    </div>
+                    <div style="font-size:12px; color:#777;">
+                        Campos separados por <code>;</code> · 15 campos por linha.<br>
+                        Pronto para importar no Domínio Sistemas.
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
             if st.session_state.txt_bytes:
                 st.download_button(
-                    label="⬇ Baixar TXT — cli_for.txt",
+                    label="⬇ Baixar cli_for.txt",
                     data=st.session_state.txt_bytes,
                     file_name="cli_for.txt",
                     mime="text/plain",
                     use_container_width=True,
                     type="primary",
+                )
+            else:
+                st.button(
+                    "⬇ Baixar cli_for.txt",
+                    disabled=True,
+                    use_container_width=True,
                 )
 
     # ── log ────────────────────────────────────────────────────
