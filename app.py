@@ -984,18 +984,7 @@ def main():
                     use_container_width=True,
                     type="primary",
                 )
-                st.markdown(
-                    "<div style='font-size:11px; color:#888; margin-top:6px;'>"
-                    "🔐 Conteúdo Base64 (copiável):</div>",
-                    unsafe_allow_html=True,
-                )
-                st.text_area(
-                    label="",
-                    value=st.session_state.xml_b64,
-                    height=100,
-                    label_visibility="collapsed",
-                    key="xml_b64_display",
-                )
+               
             else:
                 st.button(
                     "⬇ Baixar cli_for.xml",
