@@ -3,6 +3,7 @@ import io
 import re
 import time
 import base64
+import os
 import xml.etree.ElementTree as ET
 import requests
 import pandas as pd
@@ -84,6 +85,28 @@ def apply_tr_theme():
 
 
 # ==============================
+# CARREGA O LEIAUTE cli-for.xml EM BASE64
+# (lê o bgr_base64_cli_for.txt gerado pelo script auxiliar)
+# ==============================
+@st.cache_resource
+def carregar_xml_leiaute_b64() -> str:
+    """
+    Lê bgr_base64_cli_for.txt da mesma pasta do app.py
+    e retorna a string Base64 do cli-for.xml original do Domínio.
+    """
+    caminho = os.path.join(os.path.dirname(__file__), "bgr_base64_cli_for.txt")
+    try:
+        with open(caminho, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        st.error(
+            "⚠ Arquivo 'bgr_base64_cli_for.txt' não encontrado na pasta do projeto. "
+            "Execute o script 'gerar_base64_xml.py' primeiro."
+        )
+        return ""
+
+
+# ==============================
 # UTILITÁRIOS
 # ==============================
 def texto(v):
@@ -142,7 +165,6 @@ def extrair_telefone(raw: str) -> str:
 
 
 def inteiro_seguro(v) -> str:
-    """Converte float como 9999.0 → '9999', string '9999' → '9999'."""
     t = texto(v)
     if not t:
         return ""
@@ -154,11 +176,6 @@ def inteiro_seguro(v) -> str:
 
 # ==============================
 # LEITURA DA PLANILHA DO CLIENTE
-# Colunas por POSIÇÃO:
-#   A (0) → C / F
-#   B (1) → CNPJ
-#   C (2) → Descrição Conta (informativo — IGNORADO)
-#   D (3) → Conta Patrimonial
 # ==============================
 def ler_planilha_cliente(arquivo_bytes: bytes) -> tuple:
     erros     = []
@@ -178,7 +195,6 @@ def ler_planilha_cliente(arquivo_bytes: bytes) -> tuple:
 
         df = df.fillna("")
 
-        # ── detecta linha de cabeçalho ──────────────────────
         inicio_dados = 1
         for i in range(min(10, len(df))):
             vals   = [str(v).strip().lower() for v in df.iloc[i].tolist()]
@@ -192,10 +208,9 @@ def ler_planilha_cliente(arquivo_bytes: bytes) -> tuple:
             while len(row) < 4:
                 row.append("")
 
-            col_a = texto(row[0])   # C / F
-            col_b = texto(row[1])   # CNPJ
-            # col_c = ignorado       # Descrição Conta (informativo)
-            col_d = texto(row[3])   # Conta Patrimonial
+            col_a = texto(row[0])
+            col_b = texto(row[1])
+            col_d = texto(row[3])
 
             if not col_a and not col_b and not col_d:
                 continue
@@ -209,8 +224,8 @@ def ler_planilha_cliente(arquivo_bytes: bytes) -> tuple:
                 tipo = "C"
 
             registros.append({
-                "tipo"            : tipo,
-                "cnpj_raw"        : cnpj_raw,
+                "tipo"             : tipo,
+                "cnpj_raw"         : cnpj_raw,
                 "conta_patrimonial": col_d,
             })
 
@@ -222,7 +237,6 @@ def ler_planilha_cliente(arquivo_bytes: bytes) -> tuple:
 
 # ==============================
 # CONSULTA API — RECEITA FEDERAL
-# BrasilAPI (principal) + ReceitaWS (fallback)
 # ==============================
 BRASILAPI_URL = "https://brasilapi.com.br/api/cnpj/v1/{cnpj}"
 RECEITAWS_URL = "https://receitaws.com.br/v1/cnpj/{cnpj}"
@@ -455,75 +469,6 @@ def gerar_txt_saida(registros: list) -> bytes:
 
 
 # ==============================
-# GERAÇÃO DO XML (cli_for.xml)
-# ==============================
-def _indent_xml(elem, level=0):
-    """Indentação compatível com Python 3.8 e superior."""
-    pad = "\n" + "  " * level
-    if len(elem):
-        if not elem.text or not elem.text.strip():
-            elem.text = pad + "  "
-        if not elem.tail or not elem.tail.strip():
-            elem.tail = pad
-        for child in elem:
-            _indent_xml(child, level + 1)
-        if not child.tail or not child.tail.strip():
-            child.tail = pad
-    else:
-        if level and (not elem.tail or not elem.tail.strip()):
-            elem.tail = pad
-
-
-def gerar_xml_saida(registros: list) -> bytes:
-    """Gera o cli_for.xml estruturado com 17 campos por registro."""
-    root = ET.Element("ClientesFornecedores")
-    root.set("versao", "1.0")
-    root.set("geradoPor", "Cadastro CF - Thomson Reuters")
-
-    for r in registros:
-        cf = ET.SubElement(root, "ClienteFornecedor")
-
-        def add(tag: str, value: str):
-            el = ET.SubElement(cf, tag)
-            el.text = str(value) if value else ""
-
-        cnpj_num = so_numeros(r.get("cnpj", ""))
-        cep_num  = so_numeros(r.get("cep", ""))
-
-        add("Tipo",                r.get("tipo", "C"))
-        add("RazaoSocial",         r.get("razao_social", ""))
-        add("NomeFantasia",        r.get("nome_fantasia", ""))
-        add("CPFCNPJ",             cnpj_num)
-        add("InscricaoEstadual",   inteiro_seguro(r.get("inscricao_estadual", "")))
-        add("InscricaoMunicipal",  inteiro_seguro(r.get("inscricao_municipal", "")))
-        add("SituacaoReceita",     r.get("situacao", ""))
-        add("UF",                  r.get("uf", ""))
-        add("Municipio",           r.get("municipio", ""))
-        add("Bairro",              r.get("bairro", ""))
-        add("Endereco",            r.get("logradouro", ""))
-        add("NumeroEndereco",      r.get("numero", ""))
-        add("ComplementoEndereco", r.get("complemento", ""))
-        add("CEP",                 cep_num)
-        add("Telefone",            r.get("telefone", ""))
-        add("ContaDebito",         inteiro_seguro(r.get("conta_debito", "")))
-        add("ContaPatrimonial",    inteiro_seguro(r.get("conta_patrimonial", "")))
-
-    _indent_xml(root)
-
-    buf = io.BytesIO()
-    tree = ET.ElementTree(root)
-    tree.write(buf, encoding="utf-8", xml_declaration=True)
-    buf.seek(0)
-    return buf.read()
-
-
-def gerar_xml_base64(registros: list) -> str:
-    """Retorna o cli_for.xml codificado em Base64 (string UTF-8)."""
-    xml_bytes = gerar_xml_saida(registros)
-    return base64.b64encode(xml_bytes).decode("utf-8")
-
-
-# ==============================
 # MODELO DE ENTRADA PARA DOWNLOAD
 # ==============================
 def gerar_modelo_entrada() -> bytes:
@@ -745,8 +690,7 @@ def main():
                     campos separados por <code>;</code>,
                     pronto para importação.</li>
                 <li><b>cli_for.xml</b> →
-                    XML estruturado com 17 campos,
-                    codificado em <code>Base64</code>.</li>
+                    Leiaute oficial Domínio Sistemas · Clientes e Fornecedores.</li>
             </ul>
 
             <h4>🔹 Passo 5 — Importar no Domínio</h4>
@@ -776,7 +720,7 @@ def main():
         ("log",         [f"Aplicação pronta. Versão: {VERSAO}"]),
         ("xlsx_bytes",  None),
         ("txt_bytes",   None),
-        ("xml_b64",     None),   # ← NOVO
+        ("xml_b64",     None),
     ]:
         if key not in st.session_state:
             st.session_state[key] = default
@@ -805,7 +749,7 @@ def main():
         st.session_state.log        = ["Campos limpos."]
         st.session_state.xlsx_bytes = None
         st.session_state.txt_bytes  = None
-        st.session_state.xml_b64    = None   # ← NOVO
+        st.session_state.xml_b64    = None
         st.rerun()
 
     # ── processamento ──────────────────────────────────────────
@@ -814,7 +758,7 @@ def main():
         st.session_state.log        = ["Iniciando processamento..."]
         st.session_state.xlsx_bytes = None
         st.session_state.txt_bytes  = None
-        st.session_state.xml_b64    = None   # ← NOVO
+        st.session_state.xml_b64    = None
 
         registros = processar(arquivo.read(), st.session_state.log)
         st.session_state.registros = registros
@@ -822,7 +766,8 @@ def main():
         if registros:
             st.session_state.xlsx_bytes = gerar_excel_saida(registros)
             st.session_state.txt_bytes  = gerar_txt_saida(registros)
-            st.session_state.xml_b64    = gerar_xml_base64(registros)   # ← NOVO
+            # ← USA O LEIAUTE FIXO DO DOMÍNIO (cli-for.xml original)
+            st.session_state.xml_b64    = carregar_xml_leiaute_b64()
             st.session_state.log.append("📁 Arquivos prontos para download.")
 
         st.rerun()
@@ -887,7 +832,7 @@ def main():
         st.markdown("---")
         st.markdown("#### ⬇ Exportar arquivos")
 
-        col_a, col_b, col_c = st.columns(3)   # ← era st.columns(2)
+        col_a, col_b, col_c = st.columns(3)
 
         with col_a:
             st.markdown(
@@ -955,7 +900,7 @@ def main():
                     use_container_width=True,
                 )
 
-        with col_c:   # ← NOVO bloco inteiro
+        with col_c:
             st.markdown(
                 """
                 <div style="background:#F5F5F5; border:1px solid #E0E0E0;
@@ -965,14 +910,15 @@ def main():
                         🗂 cli_for.xml
                     </div>
                     <div style="font-size:12px; color:#777;">
-                        XML estruturado · 17 campos por registro.<br>
-                        Arquivo codificado em <code>Base64</code> UTF-8.
+                        Leiaute Domínio Sistemas · Clientes e Fornecedores.<br>
+                        Arquivo de importação <code>cli_for.xml</code>.
                     </div>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
             if st.session_state.xml_b64:
+                # ← DECODIFICA O BASE64 E ENTREGA O XML ORIGINAL DO DOMÍNIO
                 xml_bytes_dl = base64.b64decode(
                     st.session_state.xml_b64.encode("utf-8")
                 )
@@ -984,7 +930,6 @@ def main():
                     use_container_width=True,
                     type="primary",
                 )
-               
             else:
                 st.button(
                     "⬇ Baixar cli_for.xml",
