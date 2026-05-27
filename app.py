@@ -653,7 +653,7 @@ def main():
                     margin-bottom:28px;">
             <h2 style="color:#FF8000; margin:0;
                        font-family:'Segoe UI',Arial,sans-serif;">
-                🏢 Cadastro de Clientes / Fornecedores &nbsp;|&nbsp; {VERSAO}
+                🏢 Cadastro Clientes e Fornecedores Analíticos &nbsp;|&nbsp; {VERSAO}
             </h2>
             <p style="color:#DDDDDD; margin:6px 0 0 0;
                       font-family:'Segoe UI',Arial,sans-serif;">
