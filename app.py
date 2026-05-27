@@ -93,7 +93,7 @@ def texto(v):
     except Exception:
         pass
     s = str(v).strip()
-    return "" if s.lower() in ("nan", "none", "") else s
+    return "" if s.lower() in ("nan", "none") else s
 
 
 def so_numeros(v):
@@ -139,114 +139,87 @@ def extrair_telefone(raw: str) -> str:
     return raw.strip()
 
 
-def linha_vazia_modelo(row: pd.Series) -> bool:
-    return all(not texto(v) for v in row.values)
-
-
 # ==============================
-# LEITURA DA PLANILHA MODELO
-# (que o cliente preenche)
-# Colunas esperadas:
-#   C: cliente / F: Fornecedor | CPF/CNPJ | Conta Patrimonial
+# LEITURA DA PLANILHA DO CLIENTE
+# Colunas fixas (por posição):
+#   A (0) → C / F
+#   B (1) → CNPJ
+#   C (2) → Descrição Conta (informativo, ignorado)
+#   D (3) → Conta Patrimonial
 # ==============================
-COLUNAS_ENTRADA = {
-    "tipo"             : ["c: cliente / f: fornecedor", "tipo", "c/f"],
-    "cnpj"             : ["cpf/cnpj", "cnpj", "cpf"],
-    "conta_patrimonial": ["conta patrimonial", "conta_patrimonial", "patrimonial"],
-    "conta_debito"     : ["conta debito", "conta débito", "conta_debito", "debito", "débito"],
-    "inscricao_estadual"  : ["inscricao estadual", "inscrição estadual", "ie"],
-    "inscricao_municipal" : ["inscricao municipal", "inscrição municipal", "im"],
-}
-
-
-def _mapear_colunas(df: pd.DataFrame) -> dict:
+def ler_planilha_cliente(arquivo_bytes: bytes) -> tuple:
     """
-    Mapeia nomes reais das colunas do DataFrame para os campos internos.
-    Tolerante a variações de case, acentos e espaços.
-    """
-    mapa = {}
-    cols_df = {str(c).strip().lower(): c for c in df.columns}
-
-    for campo, aliases in COLUNAS_ENTRADA.items():
-        for alias in aliases:
-            if alias in cols_df:
-                mapa[campo] = cols_df[alias]
-                break
-        # fallback: busca parcial
-        if campo not in mapa:
-            for col_lower, col_orig in cols_df.items():
-                for alias in aliases:
-                    if alias in col_lower or col_lower in alias:
-                        mapa[campo] = col_orig
-                        break
-                if campo in mapa:
-                    break
-
-    return mapa
-
-
-def ler_planilha_modelo(arquivo_bytes: bytes) -> tuple:
-    """
-    Lê a planilha que o cliente preencheu.
+    Lê a planilha modelo preenchida pelo cliente.
     Retorna (lista_de_dicts, lista_de_erros).
-    Cada dict contém: tipo, cnpj_raw, conta_patrimonial, conta_debito,
-                      inscricao_estadual, inscricao_municipal
+
+    Leitura por POSIÇÃO de coluna (A=0, B=1, C=2, D=3),
+    tolerando qualquer nome de cabeçalho.
     """
-    erros = []
+    erros    = []
     registros = []
 
     try:
+        # tenta xlsx, fallback para xls
         try:
-            df = pd.read_excel(io.BytesIO(arquivo_bytes), sheet_name=0, dtype=object)
+            df = pd.read_excel(
+                io.BytesIO(arquivo_bytes),
+                sheet_name=0,
+                header=None,
+                dtype=object,
+            )
         except Exception:
             df = pd.read_excel(
-                io.BytesIO(arquivo_bytes), sheet_name=0,
-                dtype=object, engine="xlrd"
+                io.BytesIO(arquivo_bytes),
+                sheet_name=0,
+                header=None,
+                dtype=object,
+                engine="xlrd",
             )
+
         df = df.fillna("")
 
-        # --- tenta detectar se o cabeçalho está na linha 0 ou em outra linha ---
-        col_names = [str(c).strip().lower() for c in df.columns]
-        tem_cabecalho = any(
-            k in " ".join(col_names)
-            for k in ["cnpj", "cpf", "tipo", "cliente", "fornecedor", "patrimonial"]
-        )
+        # ── detecta linha de cabeçalho ──────────────────────────
+        # procura a primeira linha que contenha "cnpj" ou "c/f" ou "tipo"
+        linha_cabecalho = None
+        for i in range(min(10, len(df))):
+            vals = [str(v).strip().lower() for v in df.iloc[i].tolist()]
+            joined = " ".join(vals)
+            if any(k in joined for k in ["cnpj", "cpf", "c / f", "c/f", "tipo", "cliente"]):
+                linha_cabecalho = i
+                break
 
-        if not tem_cabecalho:
-            # procura cabeçalho nas primeiras 10 linhas
-            for i in range(min(10, len(df))):
-                row_vals = [str(v).strip().lower() for v in df.iloc[i].tolist()]
-                if any(k in " ".join(row_vals) for k in ["cnpj", "cpf", "tipo", "patrimonial"]):
-                    df.columns = df.iloc[i].tolist()
-                    df = df.iloc[i+1:].reset_index(drop=True)
-                    df = df.fillna("")
-                    break
+        # pula cabeçalho; se não encontrado, assume linha 0 como cabeçalho
+        inicio_dados = (linha_cabecalho + 1) if linha_cabecalho is not None else 1
 
-        mapa = _mapear_colunas(df)
+        for i in range(inicio_dados, len(df)):
+            row = df.iloc[i].tolist()
 
-        if "cnpj" not in mapa:
-            erros.append("Coluna de CNPJ não encontrada. Verifique o modelo.")
-            return [], erros
+            # garante ao menos 4 colunas
+            while len(row) < 4:
+                row.append("")
 
-        for _, row in df.iterrows():
-            if linha_vazia_modelo(row):
+            col_a = texto(row[0])   # C / F
+            col_b = texto(row[1])   # CNPJ
+            col_c = texto(row[2])   # Descrição (ignorado)
+            col_d = texto(row[3])   # Conta Patrimonial
+
+            # pula linha completamente vazia
+            if not col_a and not col_b and not col_d:
                 continue
 
-            cnpj_raw = so_numeros(texto(row.get(mapa.get("cnpj", ""), "")))
+            cnpj_raw = so_numeros(col_b)
             if not cnpj_raw:
                 continue
 
-            tipo_raw = texto(row.get(mapa.get("tipo", ""), "")).strip().upper()
-            if tipo_raw not in ("C", "F"):
-                tipo_raw = "C"
+            tipo = col_a.strip().upper()
+            if tipo not in ("C", "F"):
+                tipo = "C"
 
             registros.append({
-                "tipo"               : tipo_raw,
-                "cnpj_raw"           : cnpj_raw,
-                "conta_patrimonial"  : texto(row.get(mapa.get("conta_patrimonial", ""), "")),
-                "conta_debito"       : texto(row.get(mapa.get("conta_debito", ""), "")),
-                "inscricao_estadual" : texto(row.get(mapa.get("inscricao_estadual", ""), "")),
-                "inscricao_municipal": texto(row.get(mapa.get("inscricao_municipal", ""), "")),
+                "tipo"            : tipo,
+                "cnpj_raw"        : cnpj_raw,
+                "conta_patrimonial": col_d,
+                # col_c é meramente informativo — não é usado
             })
 
     except Exception as e:
@@ -256,7 +229,8 @@ def ler_planilha_modelo(arquivo_bytes: bytes) -> tuple:
 
 
 # ==============================
-# CONSULTA API RECEITA FEDERAL
+# CONSULTA API — RECEITA FEDERAL
+# BrasilAPI (principal) + ReceitaWS (fallback)
 # ==============================
 BRASILAPI_URL = "https://brasilapi.com.br/api/cnpj/v1/{cnpj}"
 RECEITAWS_URL = "https://receitaws.com.br/v1/cnpj/{cnpj}"
@@ -271,25 +245,31 @@ def consultar_cnpj_api(cnpj_raw: str) -> dict:
 
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 
-    # --- BrasilAPI (principal) ---
+    # ── BrasilAPI ──────────────────────────────────────────────
     try:
         resp = requests.get(
-            BRASILAPI_URL.format(cnpj=cnpj), headers=headers, timeout=15
+            BRASILAPI_URL.format(cnpj=cnpj),
+            headers=headers,
+            timeout=15,
         )
         if resp.status_code == 429:
             time.sleep(3)
             resp = requests.get(
-                BRASILAPI_URL.format(cnpj=cnpj), headers=headers, timeout=15
+                BRASILAPI_URL.format(cnpj=cnpj),
+                headers=headers,
+                timeout=15,
             )
         if resp.status_code == 200:
             return _norm_brasilapi(resp.json())
     except Exception:
         pass
 
-    # --- ReceitaWS (fallback) ---
+    # ── ReceitaWS (fallback) ───────────────────────────────────
     try:
         resp = requests.get(
-            RECEITAWS_URL.format(cnpj=cnpj), headers=headers, timeout=15
+            RECEITAWS_URL.format(cnpj=cnpj),
+            headers=headers,
+            timeout=15,
         )
         if resp.status_code == 200:
             return _norm_receitaws(resp.json())
@@ -303,19 +283,19 @@ def _norm_brasilapi(data: dict) -> dict:
     if "message" in data or data.get("type") == "service_error":
         return {"erro": data.get("message", "CNPJ não encontrado.")}
     return {
-        "cnpj"        : so_numeros(str(data.get("cnpj", ""))),
-        "razao_social": (data.get("razao_social") or "").strip(),
+        "cnpj"         : so_numeros(str(data.get("cnpj", ""))),
+        "razao_social" : (data.get("razao_social") or "").strip(),
         "nome_fantasia": (data.get("nome_fantasia") or "").strip(),
-        "situacao"    : (data.get("descricao_situacao_cadastral") or "").strip(),
-        "uf"          : (data.get("uf") or "").strip(),
-        "municipio"   : (data.get("municipio") or "").strip(),
-        "bairro"      : (data.get("bairro") or "").strip(),
-        "logradouro"  : (data.get("logradouro") or "").strip(),
-        "numero"      : (data.get("numero") or "").strip(),
-        "complemento" : (data.get("complemento") or "").strip(),
-        "cep"         : so_numeros(str(data.get("cep", ""))),
-        "telefone"    : extrair_telefone(str(data.get("ddd_telefone_1", ""))),
-        "fonte"       : "BrasilAPI",
+        "situacao"     : (data.get("descricao_situacao_cadastral") or "").strip(),
+        "uf"           : (data.get("uf") or "").strip(),
+        "municipio"    : (data.get("municipio") or "").strip(),
+        "bairro"       : (data.get("bairro") or "").strip(),
+        "logradouro"   : (data.get("logradouro") or "").strip(),
+        "numero"       : (data.get("numero") or "").strip(),
+        "complemento"  : (data.get("complemento") or "").strip(),
+        "cep"          : so_numeros(str(data.get("cep", ""))),
+        "telefone"     : extrair_telefone(str(data.get("ddd_telefone_1", ""))),
+        "fonte"        : "BrasilAPI",
     }
 
 
@@ -323,70 +303,65 @@ def _norm_receitaws(data: dict) -> dict:
     if data.get("status") == "ERROR":
         return {"erro": data.get("message", "CNPJ não encontrado.")}
     return {
-        "cnpj"        : so_numeros(str(data.get("cnpj", ""))),
-        "razao_social": (data.get("nome") or "").strip(),
+        "cnpj"         : so_numeros(str(data.get("cnpj", ""))),
+        "razao_social" : (data.get("nome") or "").strip(),
         "nome_fantasia": (data.get("fantasia") or "").strip(),
-        "situacao"    : (data.get("situacao") or "").strip(),
-        "uf"          : (data.get("uf") or "").strip(),
-        "municipio"   : (data.get("municipio") or "").strip(),
-        "bairro"      : (data.get("bairro") or "").strip(),
-        "logradouro"  : (data.get("logradouro") or "").strip(),
-        "numero"      : (data.get("numero") or "").strip(),
-        "complemento" : (data.get("complemento") or "").strip(),
-        "cep"         : so_numeros(str(data.get("cep", ""))),
-        "telefone"    : extrair_telefone(str(data.get("telefone", ""))),
-        "fonte"       : "ReceitaWS",
+        "situacao"     : (data.get("situacao") or "").strip(),
+        "uf"           : (data.get("uf") or "").strip(),
+        "municipio"    : (data.get("municipio") or "").strip(),
+        "bairro"       : (data.get("bairro") or "").strip(),
+        "logradouro"   : (data.get("logradouro") or "").strip(),
+        "numero"       : (data.get("numero") or "").strip(),
+        "complemento"  : (data.get("complemento") or "").strip(),
+        "cep"          : so_numeros(str(data.get("cep", ""))),
+        "telefone"     : extrair_telefone(str(data.get("telefone", ""))),
+        "fonte"        : "ReceitaWS",
     }
 
 
 # ==============================
 # MONTAGEM DO REGISTRO FINAL
+# Regras:
+#   tipo             → planilha (col A)
+#   cnpj             → planilha (col B)  [col C ignorada]
+#   conta_patrimonial→ planilha (col D)
+#   tudo mais        → API Receita Federal
 # ==============================
-def montar_registro_final(entrada: dict, api: dict) -> dict:
-    """
-    Combina dados da planilha do cliente (entrada) com dados da API (api).
-    Regras:
-      - tipo C/F          → SEMPRE da planilha
-      - conta_patrimonial → SEMPRE da planilha
-      - conta_debito      → planilha (se preenchido) ou vazio
-      - insc. estadual/municipal → planilha (se preenchido) ou vazio
-      - razao_social, endereço, etc. → API (fonte primária da RF)
-    """
+def montar_registro(entrada: dict, api: dict) -> dict:
     tem_erro = "erro" in api
-
     return {
-        # identidade
-        "cnpj"               : so_numeros(entrada["cnpj_raw"]),
-        "_cnpj_fmt"          : formatar_cnpj(entrada["cnpj_raw"]),
-        # decisão do cliente
-        "tipo"               : entrada["tipo"],
-        # dados da Receita Federal
-        "razao_social"       : api.get("razao_social", "") if not tem_erro else "",
-        "nome_fantasia"      : api.get("nome_fantasia", "") if not tem_erro else "",
-        "situacao"           : api.get("situacao", "") if not tem_erro else "",
-        "uf"                 : api.get("uf", "") if not tem_erro else "",
-        "municipio"          : api.get("municipio", "") if not tem_erro else "",
-        "bairro"             : api.get("bairro", "") if not tem_erro else "",
-        "logradouro"         : api.get("logradouro", "") if not tem_erro else "",
-        "numero"             : api.get("numero", "") if not tem_erro else "",
-        "complemento"        : api.get("complemento", "") if not tem_erro else "",
-        "cep"                : api.get("cep", "") if not tem_erro else "",
-        "telefone"           : api.get("telefone", "") if not tem_erro else "",
-        # campos da planilha do cliente (nunca vêm da API pública)
-        "inscricao_estadual" : entrada.get("inscricao_estadual", ""),
-        "inscricao_municipal": entrada.get("inscricao_municipal", ""),
-        "conta_debito"       : entrada.get("conta_debito", ""),
-        "conta_patrimonial"  : entrada.get("conta_patrimonial", ""),
-        # metadados
-        "fonte"              : api.get("fonte", "—"),
-        "_erro"              : tem_erro,
-        "_msg_erro"          : api.get("erro", ""),
+        # ── da planilha do cliente ─────────────────────────────
+        "cnpj"             : so_numeros(entrada["cnpj_raw"]),
+        "_cnpj_fmt"        : formatar_cnpj(entrada["cnpj_raw"]),
+        "tipo"             : entrada["tipo"],
+        "conta_patrimonial": entrada.get("conta_patrimonial", ""),
+        # ── campos que NÃO existem na planilha de entrada
+        #    e NÃO vêm da API pública (ficam em branco)
+        "conta_debito"        : "",
+        "inscricao_estadual"  : "",
+        "inscricao_municipal" : "",
+        # ── da Receita Federal ─────────────────────────────────
+        "razao_social" : api.get("razao_social", "") if not tem_erro else "",
+        "nome_fantasia": api.get("nome_fantasia", "") if not tem_erro else "",
+        "situacao"     : api.get("situacao", "")     if not tem_erro else "",
+        "uf"           : api.get("uf", "")           if not tem_erro else "",
+        "municipio"    : api.get("municipio", "")    if not tem_erro else "",
+        "bairro"       : api.get("bairro", "")       if not tem_erro else "",
+        "logradouro"   : api.get("logradouro", "")   if not tem_erro else "",
+        "numero"       : api.get("numero", "")       if not tem_erro else "",
+        "complemento"  : api.get("complemento", "")  if not tem_erro else "",
+        "cep"          : api.get("cep", "")          if not tem_erro else "",
+        "telefone"     : api.get("telefone", "")     if not tem_erro else "",
+        # ── metadados ──────────────────────────────────────────
+        "fonte"        : api.get("fonte", "—"),
+        "_erro"        : tem_erro,
+        "_msg_erro"    : api.get("erro", ""),
     }
 
 
 # ==============================
-# GERAÇÃO DO EXCEL FINAL
-# (formato planilhamodelodominio)
+# GERAÇÃO DO EXCEL DE SAÍDA
+# Formato: planilhamodelodominio.xls
 # ==============================
 COLUNAS_SAIDA = [
     "C: cliente / F: Fornecedor",
@@ -437,10 +412,10 @@ def gerar_excel_saida(registros: list) -> bytes:
         df.to_excel(writer, index=False, sheet_name="Plan1")
         ws = writer.sheets["Plan1"]
 
-        # larguras
+        # larguras das colunas A–O
         for col_letter, width in zip(
-            "ABCDEFGHIJKLMNO",
-            [28, 42, 20, 18, 18, 6, 26, 26, 36, 14, 22, 12, 20, 14, 16]
+            list("ABCDEFGHIJKLMNO"),
+            [28, 42, 20, 18, 18, 6, 26, 26, 36, 14, 22, 12, 20, 14, 16],
         ):
             ws.column_dimensions[col_letter].width = width
 
@@ -507,27 +482,24 @@ def gerar_txt_saida(registros: list) -> bytes:
 
 
 # ==============================
-# MODELO PARA DOWNLOAD
+# MODELO DE ENTRADA PARA DOWNLOAD
 # (planilha que o cliente preenche)
 # ==============================
 def gerar_modelo_entrada() -> bytes:
     """
-    Gera a planilha modelo que o cliente preenche com:
-    C/F | CPF/CNPJ | Conta Patrimonial
-    (+ campos opcionais)
+    Gera o modelo.xlsx com as 4 colunas que o cliente preenche:
+    A: C/F  |  B: CNPJ  |  C: Descrição Conta (informativo)  |  D: Conta Patrimonial
     """
     colunas = [
         "C: cliente / F: Fornecedor",
         "CPF/CNPJ",
+        "Descrição Conta Plano Cliente",
         "Conta Patrimonial",
-        "Conta débito",
-        "Inscrição Estadual",
-        "Inscrição Municipal",
     ]
     exemplos = [
-        ["C", "99.999.999/0001-91", "7777", "9999", "1234", "789"],
-        ["F", "88.888.888/0001-81", "6666", "8888", "4321", "987"],
-        ["C", "11.222.333/0001-81", "5555", "",     "",     ""],
+        ["C", "99.999.999/0001-91", "Clientes Nacionais",   "7777"],
+        ["F", "88.888.888/0001-81", "Fornecedores Gerais",  "6666"],
+        ["C", "11.222.333/0001-81", "Clientes Exportação",  "5555"],
     ]
     df = pd.DataFrame(exemplos, columns=colunas)
     buf = io.BytesIO()
@@ -536,7 +508,7 @@ def gerar_modelo_entrada() -> bytes:
         df.to_excel(writer, index=False, sheet_name="Clientes_Fornecedores")
         ws = writer.sheets["Clientes_Fornecedores"]
 
-        for col_letter, width in zip("ABCDEF", [30, 22, 18, 14, 18, 18]):
+        for col_letter, width in zip("ABCD", [30, 22, 32, 18]):
             ws.column_dimensions[col_letter].width = width
 
         header_fill  = PatternFill("solid", fgColor="FF8000")
@@ -564,6 +536,9 @@ def gerar_modelo_entrada() -> bytes:
                 cell.alignment = left_align
                 cell.border    = thin_border
 
+        # nota informativa na coluna C
+        ws["C1"].fill = PatternFill("solid", fgColor="888888")
+
         ws.freeze_panes = "A2"
 
     buf.seek(0)
@@ -575,24 +550,24 @@ def gerar_modelo_entrada() -> bytes:
 # ==============================
 def processar(arquivo_bytes: bytes, log: list) -> list:
     """
-    1. Lê a planilha do cliente
-    2. Consulta cada CNPJ na API
+    1. Lê planilha do cliente (A=tipo, B=CNPJ, C=ignorado, D=conta_patrimonial)
+    2. Consulta cada CNPJ na API da Receita Federal
     3. Monta registros finais
     """
-    registros_entrada, erros = ler_planilha_modelo(arquivo_bytes)
+    registros_entrada, erros = ler_planilha_cliente(arquivo_bytes)
 
     for e in erros:
         log.append(f"⚠ {e}")
 
     if not registros_entrada:
-        log.append("ERRO: Nenhum registro válido encontrado na planilha.")
+        log.append("ERRO: Nenhum CNPJ válido encontrado na planilha.")
         return []
 
     log.append(f"📄 Planilha lida: {len(registros_entrada)} CNPJ(s) encontrado(s).")
 
-    total   = len(registros_entrada)
-    pbar    = st.progress(0, text="Consultando CNPJs na Receita Federal...")
-    result  = []
+    total  = len(registros_entrada)
+    pbar   = st.progress(0, text="Consultando CNPJs na Receita Federal...")
+    result = []
 
     for idx, entrada in enumerate(registros_entrada):
         cnpj_fmt  = formatar_cnpj(entrada["cnpj_raw"])
@@ -604,11 +579,13 @@ def processar(arquivo_bytes: bytes, log: list) -> list:
         )
 
         dados_api = consultar_cnpj_api(entrada["cnpj_raw"])
-        registro  = montar_registro_final(entrada, dados_api)
+        registro  = montar_registro(entrada, dados_api)
         result.append(registro)
 
         if registro["_erro"]:
-            log.append(f"✗ {cnpj_fmt} [{tipo_desc}] → {registro['_msg_erro']}")
+            log.append(
+                f"✗ {cnpj_fmt} [{tipo_desc}] → {registro['_msg_erro']}"
+            )
         else:
             log.append(
                 f"✓ {cnpj_fmt} [{tipo_desc}] → "
@@ -622,7 +599,7 @@ def processar(arquivo_bytes: bytes, log: list) -> list:
 
     ok  = sum(1 for r in result if not r["_erro"])
     err = sum(1 for r in result if r["_erro"])
-    log.append(f"✅ Sucesso : {ok}  |  ⚠ Erros : {err}  |  Total : {total}")
+    log.append(f"✅ Sucesso: {ok}  |  ⚠ Erros: {err}  |  Total: {total}")
 
     return result
 
@@ -651,9 +628,10 @@ def main():
             </h2>
             <p style="color:#DDDDDD; margin:6px 0 0 0;
                       font-family:'Segoe UI',Arial,sans-serif;">
-                Importe a planilha com <strong>Tipo C/F</strong>,
-                <strong>CNPJ</strong> e <strong>Conta Patrimonial</strong>,
-                consulte a Receita Federal e exporte no formato
+                Importe a planilha preenchida com
+                <strong>C/F</strong>, <strong>CNPJ</strong> e
+                <strong>Conta Patrimonial</strong>, consulte a
+                Receita Federal e exporte no formato
                 <strong>Domínio Sistemas</strong>.
             </p>
         </div>
@@ -665,23 +643,36 @@ def main():
     with st.sidebar:
         st.markdown("### 📥 Modelo de Planilha")
         st.markdown(
-            "Baixe o modelo, preencha com **C ou F**, "
-            "o **CNPJ** e a **Conta Patrimonial** de cada empresa."
+            "Baixe o modelo, preencha as **4 colunas** e faça o upload."
         )
         modelo_bytes = gerar_modelo_entrada()
         st.download_button(
             label="⬇ Baixar modelo de entrada (.xlsx)",
             data=modelo_bytes,
             file_name="modelo_clientes_fornecedores.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            mime=(
+                "application/vnd.openxmlformats-"
+                "officedocument.spreadsheetml.sheet"
+            ),
             use_container_width=True,
+        )
+        st.markdown("---")
+        st.markdown("### 📋 Colunas do modelo")
+        st.markdown(
+            """
+            | Col | Campo | Uso |
+            |-----|-------|-----|
+            | **A** | C / F | Obrigatório |
+            | **B** | CNPJ | Obrigatório |
+            | **C** | Descrição Conta | Informativo |
+            | **D** | Conta Patrimonial | Obrigatório |
+            """
         )
         st.markdown("---")
         st.markdown("### 📡 Fonte de dados")
         st.markdown(
-            "CNPJs consultados em tempo real via "
-            "**BrasilAPI** (Receita Federal), "
-            "com fallback para **ReceitaWS**."
+            "Receita Federal via **BrasilAPI**, "
+            "fallback automático para **ReceitaWS**."
         )
         st.markdown("---")
         st.markdown("### ℹ Sobre")
@@ -701,42 +692,47 @@ def main():
 
             <h4>🔹 Passo 2 — Preencher a planilha</h4>
             <ul>
-                <li><b>C: cliente / F: Fornecedor</b> → digite <b>C</b> ou <b>F</b>.</li>
-                <li><b>CPF/CNPJ</b> → CNPJ com ou sem formatação.</li>
-                <li><b>Conta Patrimonial</b> → código da conta (obrigatório).</li>
-                <li><b>Conta débito, Insc. Estadual/Municipal</b> → opcionais.</li>
+                <li><b>Coluna A</b> — <code>C: cliente / F: Fornecedor</code>:
+                    digite <b>C</b> ou <b>F</b>.</li>
+                <li><b>Coluna B</b> — <code>CPF/CNPJ</code>:
+                    informe o CNPJ (com ou sem formatação).</li>
+                <li><b>Coluna C</b> — <code>Descrição Conta Plano Cliente</code>:
+                    campo <b>informativo</b>, não é processado.</li>
+                <li><b>Coluna D</b> — <code>Conta Patrimonial</code>:
+                    informe o código da conta.</li>
             </ul>
-            <p>Os demais dados (Razão Social, Endereço, UF, Município, etc.)
-            serão preenchidos <b>automaticamente</b> pela consulta à
-            Receita Federal.</p>
+            <p>Razão Social, Endereço, UF, Município, CEP e demais dados
+            são preenchidos <b>automaticamente</b> pela Receita Federal.</p>
 
             <h4>🔹 Passo 3 — Upload e processamento</h4>
             <ol>
                 <li>Faça o upload da planilha preenchida.</li>
-                <li>Clique em <b>▶ Consultar Receita Federal e Gerar Arquivos</b>.</li>
-                <li>Aguarde (~1 seg por CNPJ).</li>
+                <li>Clique em
+                <b>▶ Consultar Receita Federal e Gerar Arquivos</b>.</li>
+                <li>Aguarde (~1 segundo por CNPJ).</li>
             </ol>
 
             <h4>🔹 Passo 4 — Exportar</h4>
             <ul>
-                <li><b>Excel (.xlsx)</b> → formato
-                    <code>planilhamodelodominio</code>.</li>
-                <li><b>TXT (cli_for.txt)</b> → pronto para importação
-                    no Domínio Sistemas.</li>
+                <li><b>Excel (.xlsx)</b> →
+                    formato <code>planilhamodelodominio</code>.</li>
+                <li><b>TXT (cli_for.txt)</b> →
+                    pronto para importação no Domínio Sistemas.</li>
             </ul>
 
             <h4>🔹 Passo 5 — Importar no Domínio</h4>
-            <p>Contabilidade → <b>Utilitários → Importação →
-            Clientes/Fornecedores</b>.</p>
+            <p>Contabilidade →
+            <b>Utilitários → Importação → Clientes/Fornecedores</b>.</p>
 
             <hr>
             <h4>⚠ Observações</h4>
             <ul>
-                <li>Inscrição Estadual/Municipal <b>não são retornadas</b>
-                    pela API — preencha na planilha se necessário.</li>
+                <li>Inscrição Estadual/Municipal e Conta Débito ficam
+                    <b>em branco</b> (não são retornados pela API pública
+                    e não constam no modelo de entrada).</li>
                 <li>CNPJs com erro de consulta são sinalizados no log
-                    mas <b>mantidos na exportação</b> com os dados disponíveis.</li>
-                <li>Limite da API pública: ~5 req/min —
+                    e mantidos na exportação com os campos em branco.</li>
+                <li>Limite da API: ~5 req/min —
                     intervalo automático aplicado.</li>
             </ul>
             </div>
@@ -761,7 +757,10 @@ def main():
     arquivo = st.file_uploader(
         "Selecione o arquivo (.xls / .xlsx)",
         type=["xls", "xlsx"],
-        help="Planilha com Tipo C/F, CNPJ e Conta Patrimonial",
+        help=(
+            "Planilha com 4 colunas: "
+            "C/F | CNPJ | Descrição Conta (ignorado) | Conta Patrimonial"
+        ),
     )
 
     col1, col2 = st.columns([1, 1])
@@ -773,7 +772,7 @@ def main():
             type="primary",
         )
     with col2:
-        limpar = st.button("🗑 Limpar tudo", use_container_width=True)
+        limpar = st.button("🗑 Limpar", use_container_width=True)
 
     if limpar:
         st.session_state.registros  = []
@@ -812,14 +811,14 @@ def main():
                 "Situação RF"      : r["situacao"],
                 "UF"               : r["uf"],
                 "Município"        : r["municipio"],
+                "CEP"              : formatar_cep(r["cep"]) if r["cep"] else "",
                 "Telefone"         : r["telefone"],
                 "Conta Patrimonial": r["conta_patrimonial"],
-                "Conta Débito"     : r["conta_debito"],
-                "Insc. Estadual"   : r["inscricao_estadual"],
-                "Insc. Municipal"  : r["inscricao_municipal"],
                 "Fonte"            : r["fonte"],
-                "Status"           : "✅ OK" if not r["_erro"]
-                                     else f"⚠ {r['_msg_erro']}",
+                "Status"           : (
+                    "✅ OK" if not r["_erro"]
+                    else f"⚠ {r['_msg_erro']}"
+                ),
             }
             for r in st.session_state.registros
         ])
@@ -829,11 +828,11 @@ def main():
             use_container_width=True,
             hide_index=True,
             column_config={
-                "CNPJ"         : st.column_config.TextColumn("CNPJ",  width="medium"),
-                "Tipo"         : st.column_config.TextColumn("Tipo",  width="small"),
+                "CNPJ"         : st.column_config.TextColumn("CNPJ",         width="medium"),
+                "Tipo"         : st.column_config.TextColumn("Tipo",         width="small"),
                 "Razão Social" : st.column_config.TextColumn("Razão Social", width="large"),
                 "Situação RF"  : st.column_config.TextColumn("Situação RF",  width="small"),
-                "Status"       : st.column_config.TextColumn("Status", width="large"),
+                "Status"       : st.column_config.TextColumn("Status",       width="large"),
             },
         )
 
@@ -855,7 +854,7 @@ def main():
         if err:
             st.warning(
                 f"⚠ {err} CNPJ(s) com erro de consulta — "
-                "incluídos na exportação apenas com os dados da planilha."
+                "exportados com os campos da Receita Federal em branco."
             )
 
         # ── downloads ─────────────────────────────────────────
@@ -891,7 +890,10 @@ def main():
     st.markdown("---")
     st.markdown("**Log de processamento**")
     log_texto = "\n".join(str(l) for l in st.session_state.log)
-    tem_erro  = any("ERRO" in str(l) or "✗" in str(l) for l in st.session_state.log)
+    tem_erro  = any(
+        str(l).startswith("ERRO") or "✗" in str(l)
+        for l in st.session_state.log
+    )
     cor_borda = "#D32F2F" if tem_erro else "#388E3C"
 
     st.markdown(
